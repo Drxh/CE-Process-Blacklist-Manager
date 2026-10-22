@@ -1,8 +1,8 @@
 --[[
-CE Process Blacklist Manager v1.3
-Target: Cheat Engine 6.7 ~ 7.5 (Windows)
+CE Process Blacklist Manager v1.4.1 (CE 7.x)
+Target: Cheat Engine 7.x (Windows)
 
-v1.3 architecture:
+v1.4 architecture:
 - Keep the executable blacklist in autorun\CEProcessBlacklist.txt.
 - Mirror executable names into CE's native commonProcessesList.txt so the
   Processes tab keeps CE's native no-flash filtering.
@@ -13,6 +13,11 @@ v1.3 architecture:
   processes/windows unless a list change is detected.
 - After blacklist edits, refresh the currently open process picker once and
   immediately apply the one-shot filter.
+
+v1.4 CE 7.x change:
+The legacy watcher described above has been removed from this file. CE 7.x
+uses form-show, tab-change and manual-refresh events only; it never polls
+process windows in the background.
 ]]
 
 -- Stop older test versions when manually reloading in the same CE session.
@@ -24,6 +29,12 @@ local function stopOldVersion(globalName)
       old.timer.Enabled = false
       old.timer.destroy()
       old.timer = nil
+    end
+  end)
+  pcall(function()
+    if old.formNotification and type(unregisterFormAddNotification) == 'function' then
+      unregisterFormAddNotification(old.formNotification)
+      old.formNotification = nil
     end
   end)
   pcall(function()
@@ -51,22 +62,25 @@ for _, n in ipairs({
   'CEProcessBlacklistManagerV10',
   'CEProcessBlacklistManagerV11',
   'CEProcessBlacklistManagerV12',
+  'CEProcessBlacklistManagerV13',
+  'CEProcessBlacklistManagerV14',
 }) do
   stopOldVersion(n)
 end
 
-if rawget(_G, 'CEProcessBlacklistManagerV13') then return end
+if rawget(_G, 'CEProcessBlacklistManagerV15') then return end
 
 local M = {
-  version = '1.3.0',
+  version = '1.4.1',
   timer = nil,
+  pendingForms = {},
   manager = nil,
   attached = {},
   lastWindow = nil,
   formNotification = nil,
   hookSeq = 0,
 }
-CEProcessBlacklistManagerV13 = M
+CEProcessBlacklistManagerV15 = M
 
 local function trim(s)
   if s == nil then return '' end
@@ -521,16 +535,23 @@ local function applyVisibleBlacklistOnce(f)
   local pl = getProcessListControl(f)
   if not pl then return 0 end
 
-  local pidMap = buildPidNameMap()
   local count = 0
   if not pcall(function() count = pl.Items.Count end) then return 0 end
 
   local removed = 0
+  local pidMap = nil
   pcall(function() pl.Items.beginUpdate() end)
   for i = (count or 0) - 1, 0, -1 do
     local row = ''
     pcall(function() row = tostring(pl.Items[i] or '') end)
-    local exe = exeNameFromRow(row, pidMap)
+    -- The Processes tab already carries "PID-executable.exe".  Do not call
+    -- getProcesslist() for it: that API is comparatively expensive and used
+    -- to make opening the picker slower after it had been opened repeatedly.
+    local exe = exeNameFromRow(row, nil)
+    if not exe then
+      if pidMap == nil then pidMap = buildPidNameMap() end
+      exe = exeNameFromRow(row, pidMap)
+    end
     if exe and blockedSet[lower(baseName(exe))] then
       local ok = pcall(function() pl.Items.delete(i) end)
       if ok then removed = removed + 1 end
@@ -634,6 +655,11 @@ end
 
 local function hookProcessWindowRefresh(f, entry)
   if not f or not entry then return end
+  -- In CE 7 the form-show handler is the reliable point at which the native
+  -- list has finished being populated.  Filtering here replaces the old
+  -- perpetual signature-polling timer.
+  hookRefreshEvent(f, 'OnShow', f, entry, 'showHook')
+
   local tabs = findOwnedComponent(f, 'TabHeader')
   if tabs then hookRefreshEvent(tabs, 'OnChange', f, entry, 'tabChangeHook') end
 
@@ -1032,10 +1058,6 @@ local function attachProcessWindow(f)
     M.attached[key] = nil
   end
 
-  -- Sync native EXE entries once when a new process picker is discovered.
-  -- Do NOT do this from every discovery timer tick.
-  pcall(function() syncNativeCommonList() end)
-
   destroyOldControls(f)
   local b = makeBlacklistButton(f)
   if b then
@@ -1052,23 +1074,75 @@ local function attachProcessWindow(f)
 
   -- Use the event hook when CE exposes it. The list-signature fallback below is the compatibility path for CE 6.7 builds where method-property replacement is unreliable.
   hookProcessWindowRefresh(f, entry)
+end
 
-  -- If we only discovered an already-visible CE 6.7 process picker (older CE
-  -- may not provide registerFormAddNotification), reload its native list once.
+-- registerFormAddNotification can fire before CE 7.6 has finished loading
+-- the controls from the process-picker form resource.  Adding our button at
+-- that instant makes CE overwrite it during the remainder of form creation.
+-- Queue a short, bounded readiness check instead of keeping a permanent
+-- watcher alive for the whole CE session.
+local function isProcessWindowReady(f)
+  if not isProcessWindow(f) then return false end
+  if not getProcessListControl(f) then return false end
+  if not findOwnedComponent(f, 'btnNetwork') then return false end
+  local h = 0
+  pcall(function() h = f.ClientHeight or 0 end)
+  return tonumber(h) ~= nil and tonumber(h) > 0
+end
+
+local function finishQueuedProcessWindow(f)
+  attachProcessWindow(f)
   local visible = false
   pcall(function() visible = f.Visible end)
   if visible then
-    pcall(function() reloadNativeListInOpenWindow(f) end)
+    -- The form may already have received OnShow before the deferred attach.
+    -- Apply the currently visible page once; later changes use event hooks.
     pcall(function() applyVisibleBlacklistOnce(f) end)
-    entry.lastSignature = makeListSignature(f)
   end
+end
+
+local function queueProcessWindowAttach(f)
+  if not isProcessWindow(f) then return end
+
+  if isProcessWindowReady(f) then
+    finishQueuedProcessWindow(f)
+    return
+  end
+
+  local key = windowKey(f)
+  M.pendingForms[key] = {form = f, tries = 0}
+
+  if not M.timer then
+    M.timer = createTimer(getMainForm())
+    M.timer.Interval = 150
+    M.timer.OnTimer = function()
+      for pendingKey, pending in pairs(M.pendingForms) do
+        local form = pending and pending.form or nil
+        pending.tries = (pending.tries or 0) + 1
+        if not form or not isProcessWindow(form) then
+          M.pendingForms[pendingKey] = nil
+        elseif isProcessWindowReady(form) then
+          local ok, err = pcall(function() finishQueuedProcessWindow(form) end)
+          if not ok then writeErrorLog('Deferred process window attach: ' .. tostring(err)) end
+          M.pendingForms[pendingKey] = nil
+        elseif pending.tries >= 20 then
+          -- At most three seconds per new window; never turn this into a
+          -- session-wide polling loop if CE abandons a half-created form.
+          writeErrorLog('Process window did not become ready within 3 seconds')
+          M.pendingForms[pendingKey] = nil
+        end
+      end
+      if next(M.pendingForms) == nil and M.timer then M.timer.Enabled = false end
+    end
+  end
+  M.timer.Enabled = true
 end
 
 local function scanProcessWindows()
   local count = getFormCount()
   for i = 0, count - 1 do
     local f = getForm(i)
-    if isProcessWindow(f) then attachProcessWindow(f) end
+    if isProcessWindow(f) then queueProcessWindowAttach(f) end
   end
 end
 
@@ -1105,7 +1179,7 @@ local function init()
     local okNotify, obj = pcall(function()
       return registerFormAddNotification(function(form)
         local ok, e = pcall(function()
-          if isProcessWindow(form) then attachProcessWindow(form) end
+          if isProcessWindow(form) then queueProcessWindowAttach(form) end
         end)
         if not ok then writeErrorLog('FormAddNotification: ' .. tostring(e)) end
       end)
@@ -1113,18 +1187,10 @@ local function init()
     if okNotify then M.formNotification = obj end
   end
 
+  -- Catch a picker that happened to be open while this autorun script loaded.
+  -- This scan runs once only. Subsequent pickers are handled by CE's form-add
+  -- notification and their own show/tab/refresh events.
   scanProcessWindows()
-
-  -- Lightweight watcher. Every tick only checks existing form/list state.
-  -- PID enumeration happens only when the visible list signature changes.
-  M.timer = createTimer(getMainForm())
-  M.timer.Interval = 120
-  M.timer.OnTimer = function()
-    local ok, err = pcall(scanProcessWindows)
-    if not ok then writeErrorLog('Timer scan: ' .. tostring(err)) end
-    local ok2, err2 = pcall(singleShotListFallback)
-    if not ok2 then writeErrorLog('Timer list fallback: ' .. tostring(err2)) end
-  end
 end
 
 local ok, err = pcall(init)
