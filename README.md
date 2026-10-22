@@ -2,11 +2,21 @@
 
 为 Cheat Engine 的“进程列表”增加一个可视化、可批量管理的进程黑名单。
 
-当前目标兼容版本：**Cheat Engine 6.7 ~ 7.5 / Windows**。
+当前版本：**v1.3 基线**。
 
-当前版本：**v1.3**。
+> CE 6.x 已确认可用；CE 7.x 单独维护，后续修复不会影响 CE 6.x。
 
-> 当前仍处于测试阶段。6.7 是主要实测目标，7.5 会继续做兼容验证。
+## 目录与版本
+
+```text
+CE6.x/
+└─ CEProcessBlacklist.lua  # 已确认可用的 CE 6.x 版本
+
+CE7.x/
+└─ CEProcessBlacklist.lua  # CE 7.x 独立修复基线
+```
+
+两个目录当前都从 v1.3 基线开始。后续仅在 `CE7.x` 中修复 Cheat Engine 7.x 的兼容问题；`CE6.x` 保持稳定，避免版本互相影响。
 
 ## 功能
 
@@ -155,7 +165,11 @@ Cheat Engine 6.7\autorun\
 CEProcessBlacklist.lua
 ```
 
-4. 把本项目的 `CEProcessBlacklist.lua` 放入 `autorun`。
+4. 按你的 Cheat Engine 大版本选择对应文件，并把它放入 `autorun`：
+
+   - Cheat Engine 6.x：`CE6.x\CEProcessBlacklist.lua`
+   - Cheat Engine 7.x：`CE7.x\CEProcessBlacklist.lua`
+
 5. 如果已经存在：
 
 ```text
@@ -281,10 +295,10 @@ autorun\CEProcessBlacklist_error.log
 
 ## 兼容性
 
-目标：
+当前维护范围：
 
-- Cheat Engine 6.7
-- Cheat Engine 7.5
+- `CE6.x`：Cheat Engine 6.x；已确认可用。
+- `CE7.x`：Cheat Engine 7.x；独立维护，等待针对 7.x 的兼容问题修复。
 
 v1.0 的原则是：
 
